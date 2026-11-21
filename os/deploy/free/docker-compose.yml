@@ -1,0 +1,45 @@
+# Free hosting stack: app + Cloudflare Tunnel (no open ports, free HTTPS/CDN) + nightly file backup.
+# Run from this folder:  docker compose --env-file ../../.env up -d --build
+# Cap container logs so they can never fill the disk.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  swkos:
+    build: ../..
+    restart: unless-stopped
+    logging: *logging
+    env_file: [../../.env]
+    environment:
+      DATA_DIR: /data
+      # Keeps Node inside a 1 GB VM; raise on bigger machines.
+      NODE_OPTIONS: --max-old-space-size=${NODE_HEAP_MB:-400}
+    volumes: [swkos-data:/data]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    logging: *logging
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+    depends_on: [swkos]
+
+  # Daily copy of /data (uploads, SQLite, keys) to BACKUP_DIR, which can be an HDD or a second disk.
+  # Archives older than 14 days are pruned inside this container only.
+  backup:
+    image: alpine:3.20
+    restart: unless-stopped
+    logging: *logging
+    volumes:
+      - swkos-data:/data:ro
+      - ${BACKUP_DIR:-./backups}:/backup
+    command: >
+      sh -c 'while true; do
+      tar czf /backup/swkos-$$(date +%F).tgz -C /data . ;
+      find /backup -name "swkos-*.tgz" -mtime +14 -delete ;
+      sleep 86400 ; done'
+
+volumes:
+  swkos-data:

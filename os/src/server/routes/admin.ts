@@ -1,0 +1,274 @@
+import { validateDocumentSeal } from '../document-seal'
+import type { FastifyInstance } from 'fastify'
+import fs from 'node:fs'
+import path from 'node:path'
+import { z } from 'zod'
+import { db,q,tx,inDemo } from '../db'
+import { dirs,config,BACKUP_EXT,isBackupFile } from '../config'
+import { loadSettings,publicSettings,setSettings,SETTING_DEFAULTS,SECRET_SETTINGS } from '../settings'
+import { audit,getDef,getRecord,SYSTEM_CTX,createRecord } from '../engine'
+import { bad,forbidden,nowIso,safeJson,todayStr,notFound } from '../util'
+import { idOf,need } from './helpers'
+import { retryOutbox,verifySmtp,smtpConfigured,queueEmail } from '../mailer'
+import { generatePayroll,lastIssued } from '../domain/misc'
+import { destroyUserSessions,loadUser,hashPassword,validatePasswordStrength } from '../auth'
+import crypto from 'node:crypto'
+import { ENTITY_LIST } from '../../shared/entities'
+import { isOwnerSwkUser,isAdminSwkUser,canOpenEmployeeRecords } from '../../shared/swk-staff-access'
+
+export default async function (app: FastifyInstance) {
+  app.post('/api/workflow-runs/:id/retry',async req=>{
+    need(req,'admin','edit')
+    const b=z.object({reason:z.string().trim().min(10).max(1000)}).parse(req.body)
+    return tx(()=>{
+      const id=idOf((req.params as any).id),r=getRecord(getDef('workflow_runs'),id,req.ctx,{children:false})
+      if(r.status!=='Failed')throw bad('Only failed internal actions can be retried')
+      const payload:any=typeof r.payload==='string'?safeJson(r.payload,{}):r.payload??{}
+      const action=payload.rule?.action??''
+      if(!['Create follow-up task','Notify user','Queue e-mail to customer contact','Queue e-mail to address','Set field value'].includes(action))throw bad('External outcomes require review and cannot be replayed automatically')
+      q.run(`UPDATE workflow_runs SET status='Queued',max_attempts=attempts+3,next_at=?,error=NULL WHERE id=? AND status='Failed'`,nowIso(),id)
+      audit(req.ctx,getDef('workflow_runs'),id,'retry_workflow',{reason:b.reason},r._title)
+      return {ok:true}
+    })
+  })
+  app.post('/api/workflow-runs/:id/resolve',async req=>{
+    need(req,'admin','edit')
+    const b=z.object({outcome:z.enum(['Succeeded','Cancelled']),reason:z.string().trim().min(10).max(1000)}).parse(req.body)
+    return tx(()=>{
+      const id=idOf((req.params as any).id),r=getRecord(getDef('workflow_runs'),id,req.ctx,{children:false})
+      if(r.status!=='Needs review')throw bad('Only uncertain runs can be resolved manually')
+      q.run(`UPDATE workflow_runs SET status=?,finished_at=? WHERE id=? AND status='Needs review'`,b.outcome,nowIso(),id)
+      audit(req.ctx,getDef('workflow_runs'),id,'resolve_workflow',{outcome:b.outcome,reason:b.reason},r._title)
+      return {ok:true}
+    })
+  })
+
+  app.get('/api/admin/settings', async (req) => { need(req, 'admin', 'view'); return publicSettings() })
+  app.put('/api/admin/settings', async (req) => {
+    need(req, 'admin', 'edit')
+    const patch = { ...(req.body as Record<string, any>) }
+    for (const k of SECRET_SETTINGS) if (patch[k] === '********') delete patch[k]
+    delete patch.mail_accounts; delete patch.supabase_cursors; delete patch.seeded
+    // the office Wi-Fi and GPS lock belong to the Admin alone (Settings, Attendance Wi-Fi)
+    if (!isAdminSwkUser(req.user)) for (const k of Object.keys(patch)) if (/^office_(wifi|gps)_/.test(k)) delete patch[k]
+    const num = ['quote_validity_days', 'min_margin_pct', 'bill_approval_limit', 'payment_approval_limit', 'weight_divisor_air', 'weight_divisor_courier', 'sanctions_review_days', 'free_days_default', 'smtp_port', 'aml_cash_threshold', 'aml_filing_days']
+    for (const k of num) if (k in patch && patch[k] !== '') { const v = Number(patch[k]); if (!Number.isFinite(v) || v < 0) throw bad(`${k} must be a non-negative number`); patch[k] = v }
+    if ('company_trn' in patch && patch.company_trn && !/^\d{15}$/.test(String(patch.company_trn).replace(/\s/g, ''))) throw bad('A UAE TRN has 15 digits')
+    if ('company_trn' in patch) patch.company_trn = String(patch.company_trn ?? '').replace(/\s/g, '')
+    for (const [k, opts] of [['compliance_mode', ['enforce', 'advisory']], ['activity_scope_mode', ['off', 'warn', 'block']], ['vat_filing_frequency', ['Quarterly', 'Monthly']], ['rent_cap_mode', ['enforce', 'advisory']]] as const) if (k in patch && !(opts as readonly string[]).includes(patch[k])) throw bad(`${k} must be one of ${opts.join(', ')}`)
+    if ('financial_year_end' in patch && !/^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(patch.financial_year_end)) throw bad('Financial year end must be MM-DD, e.g. 12-31')
+    if ('lock_date' in patch && patch.lock_date && !/^\d{4}-\d{2}-\d{2}$/.test(patch.lock_date)) throw bad('Lock date must be YYYY-MM-DD')
+    if ('invoice_no_pattern' in patch) {
+      const pat = String(patch.invoice_no_pattern ?? '').trim()
+      const tokens = pat.match(/\{[^}]*\}/g) ?? []
+      if (!pat || pat.length > 60 || !/^[A-Za-z0-9/\-_.{}:]+$/.test(pat) || !/\{seq:[1-8]\}/.test(pat) || tokens.some(t => !/^\{(prefix|branch|YY|YYYY|MM|DD|seq:[1-8])\}$/.test(t)) || tokens.filter(t => t.startsWith('{seq')).length !== 1) throw bad('Invoice number format must contain one {seq:3}-style counter and may use {prefix} {branch} {YY} {YYYY} {MM} {DD}, for example {branch}/INV{seq:3}')
+      patch.invoice_no_pattern = pat
+    }
+    if ('document_seal' in patch) patch.document_seal = validateDocumentSeal(patch.document_seal)
+    if ('document_seal_default' in patch && typeof patch.document_seal_default !== 'boolean') throw bad('Document seal default must be true or false')
+    const before = publicSettings()
+    setSettings(patch)
+    const after = publicSettings()
+    const changes: Record<string, [any, any]> = {}
+    for (const k of Object.keys(patch)) if (k in SETTING_DEFAULTS && JSON.stringify(before[k]) !== JSON.stringify(after[k])) changes[k] = SECRET_SETTINGS.has(k) ? ['***', '***'] : k === 'document_seal' ? [before[k] ? 'Image configured' : 'No image', after[k] ? 'Image configured' : 'No image'] : [before[k], after[k]]
+    if (Object.keys(changes).length) audit(req.ctx, getDef('branches'), 0, 'settings', changes, 'Company settings')
+    return publicSettings()
+  })
+  app.post('/api/admin/smtp-test', async (req) => { need(req, 'admin', 'edit'); return verifySmtp() })
+  app.post('/api/admin/outbox/retry', async (req) => { need(req, 'admin', 'edit'); retryOutbox(); return { ok: true, smtp: smtpConfigured() } })
+
+  // ---- audit viewer
+  app.get('/api/admin/audit', async (req) => {
+    need(req, 'admin', 'view')
+    const s = req.query as any
+    const cl: string[] = []; const a: any[] = []
+    if (s.entity) { cl.push('entity = ?'); a.push(String(s.entity)) }
+    if (s.user) { cl.push('user_name LIKE ?'); a.push(`%${s.user}%`) }
+    if (s.action) { cl.push('action = ?'); a.push(String(s.action)) }
+    if (s.q) { cl.push('(record_label LIKE ? OR changes LIKE ?)'); a.push(`%${s.q}%`, `%${s.q}%`) }
+    if (s.from) { cl.push('at >= ?'); a.push(String(s.from)) }
+    if (s.to) { cl.push('at <= ?'); a.push(String(s.to) + 'T23:59:59') }
+    const where = cl.length ? 'WHERE ' + cl.join(' AND ') : ''
+    const page = Math.max(1, Number(s.page) || 1), size = Math.min(Number(s.pageSize) || 50, 200)
+    const total = q.val<number>(`SELECT COUNT(*) FROM audit_log ${where}`, ...a) ?? 0
+    const rows = q.all(`SELECT * FROM audit_log ${where} ORDER BY id DESC LIMIT ? OFFSET ?`, ...a, size, (page - 1) * size).map(r => ({ ...r, changes: safeJson(r.changes, null) }))
+    return { total, page, pageSize: size, rows }
+  })
+  app.get('/api/admin/login-events', async (req) => { need(req, 'admin', 'view'); return q.all(`SELECT * FROM login_events ORDER BY id DESC LIMIT 200`) })
+
+  /** Owner / Admin only: the role, module rights and recent use of the user linked to an employee. */
+  app.get('/api/admin/employees/:id/access', async (req) => {
+    if (!canOpenEmployeeRecords(req.user)) throw forbidden('Only the Owner and the Admin can see staff access.')
+    const emp = q.get(`SELECT id, name, email, user_id FROM employees WHERE id = ? AND deleted_at IS NULL`, idOf((req.params as any).id))
+    if (!emp) throw notFound('Employee not found')
+    const userId = emp.user_id ?? q.val<number>(`SELECT id FROM users WHERE lower(email) = ? AND party_id IS NULL AND deleted_at IS NULL`, String(emp.email || '').toLowerCase())
+    if (!userId) return { employee: emp, user: null }
+    const u = loadUser(userId)
+    const row = q.get(`SELECT active, last_login_at, locked_until, failed_logins, must_change_password, totp_secret IS NOT NULL AS totp FROM users WHERE id = ?`, userId)
+    const since = new Date(Date.now() - 30 * 864e5).toISOString()
+    return {
+      employee: emp,
+      user: { id: userId, email: u?.email, role: u?.role_name, permissions: u?.permissions ?? {}, active: !!row?.active, lastLogin: row?.last_login_at, lockedUntil: row?.locked_until, failedLogins: row?.failed_logins ?? 0, mustChangePassword: !!row?.must_change_password, totp: !!row?.totp },
+      sessions: q.val<number>(`SELECT COUNT(*) FROM sessions WHERE user_id = ? AND expires_at > ?`, userId, nowIso()) ?? 0,
+      logins: q.all(`SELECT at, success, reason, ip, user_agent FROM login_events WHERE user_id = ? ORDER BY id DESC LIMIT 15`, userId),
+      usage: q.all(`SELECT entity, action, COUNT(*) AS n FROM audit_log WHERE user_id = ? AND at >= ? GROUP BY entity, action ORDER BY n DESC LIMIT 30`, userId, since),
+      recent: q.all(`SELECT at, entity, record_label, action FROM audit_log WHERE user_id = ? ORDER BY id DESC LIMIT 20`, userId),
+    }
+  })
+
+  // ---- user administration
+  /** An administrator with limited rights must not be able to lock out, unlock or strip 2-step verification from a full administrator. */
+  const manageUser = (req: any) => {
+    need(req, 'admin', 'edit')
+    const id = idOf(req.params.id)
+    const target = loadUser(id)
+    if (isOwnerSwkUser(target) && !isOwnerSwkUser(req.user)) {
+      throw bad('Only Owner Shabib Siraj (shabib@swk.properties) has control over the Owner account. Admin (admin@swk.properties) cannot modify or sign out the Owner.')
+    }
+    if (target?.permissions === '*' && req.user.permissions !== '*') throw bad('Only a full administrator can change another full administrator')
+    return id
+  }
+  app.post('/api/admin/users/:id/unlock', async (req) => { const id = manageUser(req); q.run(`UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?`, id); audit(req.ctx, getDef('users'), id, 'unlock', null, ''); return { ok: true } })
+  app.post('/api/admin/users/:id/reset-2fa', async (req) => { const id = manageUser(req); q.run(`UPDATE users SET totp_secret = NULL WHERE id = ?`, id); audit(req.ctx, getDef('users'), id, 'reset-2fa', null, ''); return { ok: true } })
+  app.post('/api/admin/users/:id/sign-out', async (req) => { const id = manageUser(req); destroyUserSessions(id); audit(req.ctx, getDef('users'), id, 'force-signout', null, ''); return { ok: true } })
+
+  // ---- Invitations and password recovery: one-time link, stored hashed, never reveals whether an address exists
+  const sha = (t: string) => crypto.createHash('sha256').update(t).digest('hex')
+  function sendLink(user: { id: number; email: string; name: string }, kind: 'invite' | 'reset') {
+    const token = crypto.randomBytes(24).toString('hex')
+    const hours = kind === 'invite' ? 72 : 1
+    q.run(`UPDATE user_invites SET used_at = ? WHERE user_id = ? AND used_at IS NULL`, nowIso(), user.id)
+    q.run(`INSERT INTO user_invites (user_id, token_hash, kind, expires_at, created_at) VALUES (?,?,?,?,?)`, user.id, sha(token), kind, new Date(Date.now() + hours * 3600_000).toISOString(), nowIso())
+    const link = `${(config.baseUrl || '').replace(/\/+$/, '')}/accept-invite?token=${token}`
+    queueEmail({ to: user.email, userId: user.id, subject: kind === 'invite' ? 'You have been invited to SWK OS' : 'Reset your SWK OS password', body: `Hello ${user.name},\n\n${kind === 'invite' ? 'Set your password to start using SWK OS' : 'Choose a new password'}: ${link}\n\nThis link works once and expires in ${hours} hour${hours > 1 ? 's' : ''}. If you did not expect it, ignore this email.` })
+    return link
+  }
+  app.post('/api/admin/users/:id/invite', async (req) => {
+    const id = manageUser(req)
+    const u = loadUser(id)
+    if (!u?.email) throw bad('This user has no email address')
+    sendLink({ id, email: u.email, name: u.name }, 'invite')
+    audit(req.ctx, getDef('users'), id, 'invite', null, u.email)
+    return { ok: true, emailed: smtpConfigured() }
+  })
+  app.post('/api/public/invite/forgot', { config: { rateLimit: { max: 5, timeWindow: '15 minutes' } } }, async (req) => {
+    const email = String(z.object({ email: z.string().email().max(160) }).parse(req.body).email).toLowerCase()
+    const u = q.get(`SELECT id, name, email FROM users WHERE lower(email) = ? AND deleted_at IS NULL AND active = 1 AND party_id IS NULL`, email)
+    if (u) sendLink({ id: u.id, email: u.email, name: u.name }, 'reset')
+    return { ok: true }
+  })
+  app.post('/api/public/invite/accept', { config: { rateLimit: { max: 10, timeWindow: '15 minutes' } } }, async (req) => {
+    const b = z.object({ token: z.string().min(20).max(100), password: z.string().max(200) }).parse(req.body)
+    const inv = q.get(`SELECT id, user_id FROM user_invites WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`, sha(b.token), nowIso())
+    if (!inv) throw bad('This link is invalid or has expired. Ask for a new one.')
+    validatePasswordStrength(b.password)
+    q.run(`UPDATE users SET password_hash = ?, must_change_password = 0, failed_logins = 0, locked_until = NULL, updated_at = ? WHERE id = ?`, hashPassword(b.password), nowIso(), inv.user_id)
+    q.run(`UPDATE user_invites SET used_at = ? WHERE id = ?`, nowIso(), inv.id)
+    destroyUserSessions(inv.user_id)
+    return { ok: true }
+  })
+
+  // ---- API keys: show the key once at creation
+  app.post('/api/admin/api-keys', async (req) => {
+    need(req, 'admin', 'create')
+    lastIssued.key = undefined
+    const rec = createRecord(getDef('api_keys'), req.body as any, req.ctx)
+    const key = lastIssued.key; lastIssued.key = undefined
+    return { record: rec, key }
+  })
+
+  // ---- roles (permission matrix is edited through the generic API; this lists modules)
+  app.get('/api/admin/roles', async (req) => {
+    need(req, 'admin', 'view')
+    return q.all(`SELECT r.id, r.name, r.description, r.is_system, r.permissions, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id AND u.deleted_at IS NULL) AS users FROM roles r WHERE r.deleted_at IS NULL ORDER BY r.id`).map(r => ({ ...r, permissions: safeJson(r.permissions, {}) }))
+  })
+
+  // ---- HR payroll generation
+  app.post('/api/hr/payroll/generate', async (req) => {
+    need(req, 'hr', 'create')
+    const { period } = z.object({ period: z.string() }).parse(req.body)
+    return generatePayroll(period, req.ctx)
+  })
+  app.post('/api/hr/leave/:id/:action', async (req) => {
+    need(req, 'hr', 'approve')
+    const p = req.params as any
+    if (!['approve', 'reject', 'cancel'].includes(p.action)) throw bad('Unknown action')
+    const def = getDef('leave_requests')
+    const status = p.action === 'approve' ? 'Approved' : p.action === 'reject' ? 'Rejected' : 'Cancelled'
+    const r = getRecord(def, idOf(p.id), req.ctx, { children: false })
+    if (r.status !== 'Pending' && !(p.action === 'cancel' && r.status === 'Approved')) throw bad(`A ${r.status.toLowerCase()} request cannot be ${status.toLowerCase()}`)
+    return (await import('../engine')).patchRecord(def, r.id, { status, approver_id: req.user!.id }, req.ctx)
+  })
+  app.post('/api/hr/attendance/clock', async (req) => {
+    need(req, 'hr', 'view')
+    const emp = q.get(`SELECT id FROM employees WHERE user_id = ? AND deleted_at IS NULL`, req.user!.id)
+    if (!emp) throw bad('Your user account is not linked to an employee record')
+    const today = todayStr(), now = new Date().toLocaleString('sv-SE', { timeZone: config.timezone }).slice(0, 16).replace(' ', 'T')
+    const row = q.get(`SELECT id, check_in, check_out FROM attendance WHERE employee_id = ? AND att_date = ? AND deleted_at IS NULL`, emp.id, today)
+    const eng = await import('../engine')
+    if (!row) { eng.createRecord(getDef('attendance'), { employee_id: emp.id, att_date: today, check_in: now, status: 'Present' }, SYSTEM_CTX); return { action: 'in', at: now } }
+    if (row.check_out) throw bad('Already clocked out today')
+    eng.patchRecord(getDef('attendance'), row.id, { check_out: now }, SYSTEM_CTX); return { action: 'out', at: now }
+  })
+
+  // ---- system info, stats and backups
+  app.get('/api/admin/system', async (req) => {
+    need(req, 'admin', 'view')
+    const counts: Record<string, number> = {}
+    for (const e of ENTITY_LIST) if (!e.child) counts[e.key] = q.val<number>(`SELECT COUNT(*) FROM "${e.key}" WHERE deleted_at IS NULL`) ?? 0
+    const size = fs.existsSync(dirs.db) ? fs.statSync(dirs.db).size : 0
+    let upl = 0; const walk = (d: string) => { for (const f of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, f.name); if (f.isDirectory()) walk(p); else upl += fs.statSync(p).size } }
+    if (fs.existsSync(dirs.uploads)) walk(dirs.uploads)
+    return { version: '1.0.0', node: process.version, env: config.env, timezone: config.timezone, db_bytes: size, upload_bytes: upl, smtp: smtpConfigured(), counts, uptime_s: Math.round(process.uptime()) }
+  })
+  app.get('/api/admin/backups', async (req) => {
+    need(req, 'admin', 'view')
+    if (inDemo()) throw forbidden('Production backups cannot be accessed from the demo workspace')
+    return fs.readdirSync(dirs.backups).filter(isBackupFile).sort().reverse().map(f => ({ name: f, bytes: fs.statSync(path.join(dirs.backups, f)).size, at: fs.statSync(path.join(dirs.backups, f)).mtime.toISOString() }))
+  })
+  app.post('/api/admin/backups', async (req) => {
+    need(req, 'admin', 'edit')
+    if (inDemo()) throw forbidden('Production backups cannot be created from the demo workspace')
+    const name = `swk-${nowIso().replace(/[:.]/g, '-').slice(0, 19)}${BACKUP_EXT}`
+    await db.backup(path.join(dirs.backups, name))
+    audit(req.ctx, getDef('branches'), 0, 'backup', { file: [null, name] }, name)
+    return { name }
+  })
+  app.get('/api/admin/backups/:name', async (req, reply) => {
+    need(req, 'admin', 'export')
+    if (inDemo()) throw forbidden('Production backups cannot be downloaded from the demo workspace')
+    const name = path.basename(String((req.params as any).name))
+    const p = path.join(dirs.backups, name)
+    if (!isBackupFile(name) || !fs.existsSync(p)) throw notFound('Backup not found')
+    reply.header('content-type', 'application/octet-stream').header('content-disposition', `attachment; filename="${name}"`)
+    return reply.send(fs.createReadStream(p))
+  })
+
+  // ---- business data: clear customers, jobs and money records, and load the SWK OS starter set
+  app.get('/api/admin/business-data', async (req) => {
+    need(req, 'admin', 'view')
+    const { businessDataSummary, starterLoaded } = await import('../domain/business-data')
+    return { ...businessDataSummary(), starter_loaded: starterLoaded(), confirm_phrase: RESET_PHRASE }
+  })
+  app.post('/api/admin/business-data/reset', async (req) => {
+    need(req, 'admin', 'delete')
+    const b = z.object({ confirm: z.string(), load_starter: z.boolean().default(false) }).parse(req.body ?? {})
+    if (b.confirm !== RESET_PHRASE) throw bad(`Type ${RESET_PHRASE} exactly to confirm`)
+    const { resetBusinessData, loadSwkStarterData, declineStarter, clearStarterDeclined } = await import('../domain/business-data')
+    const r = await resetBusinessData(req.ctx)
+    let starter: any = null
+    if (b.load_starter) { clearStarterDeclined(); starter = await loadSwkStarterData(req.ctx) } else declineStarter()
+    return { ...r, starter }
+  })
+  app.post('/api/admin/business-data/load-starter', async (req) => {
+    need(req, 'admin', 'create')
+    const { loadSwkStarterData } = await import('../domain/business-data')
+    const r = await loadSwkStarterData(req.ctx)
+    if (!r.loaded) throw bad(r.reason === 'already loaded' || r.reason === 'customer already exists' ? 'The SWK OS starter data is already in this workspace.' : `SWK OS starter data was not loaded (${r.reason}).`)
+    return r
+  })
+
+  void loadSettings
+}
+const RESET_PHRASE = 'DELETE ALL BUSINESS DATA'
+

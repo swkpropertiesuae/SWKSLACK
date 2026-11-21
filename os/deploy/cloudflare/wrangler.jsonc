@@ -1,0 +1,41 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "swk-os",
+  "main": "src/index.ts",
+  // Set this to the date you deploy.
+  "compatibility_date": "2026-10-07",
+  // Public addresses. Cloudflare creates the DNS records and HTTPS certificates on deploy (zone swk.properties must be on this account).
+  "routes": [
+    { "pattern": "os.swk.properties", "custom_domain": true }
+  ],
+  "vars": {
+    "PUBLIC_URL": "https://os.swk.properties",
+    "PG_SCHEMA": "swk",
+    "RELEASE_ID": "swkproperties-os-v4"
+  },
+  // The web app (JS, CSS, images, index.html) is served from Cloudflare's edge, so opening the app never waits for the container.
+  // Only /api/* reaches the Worker and the container. The workflow builds dist/web before deploying.
+  "assets": {
+    "directory": "../../dist/web",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": { "enabled": true },
+
+  // Wakes the app every 5 minutes so its own scheduler keeps running (reminders, e-mail outbox, nightly backup).
+  "triggers": { "crons": ["*/5 * * * *"] },
+
+  "containers": [
+    {
+      "class_name": "SwkOs",
+      "image": "../../Dockerfile",
+      "image_build_context": "../..",
+      // standard-3: 2 vCPU, 8 GiB. Node, the scheduler and the Chromium used for PDFs were CPU-starved on standard-1 (1/2 vCPU).
+      "instance_type": "standard-3",
+      // Allow up to 5 instances so rolling deployments can start the new release container before previous ones finish draining.
+      "max_instances": 5
+    }
+  ],
+  "durable_objects": { "bindings": [{ "name": "SWK_OS", "class_name": "SwkOs" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SwkOs"] }]
+}

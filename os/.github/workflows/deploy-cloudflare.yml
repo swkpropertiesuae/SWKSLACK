@@ -1,0 +1,86 @@
+name: Deploy to Cloudflare
+# Builds the app image and deploys the Worker + container (deploy/cloudflare/wrangler.jsonc).
+# Needs two repository secrets: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+# Runtime secrets (DATABASE_URL, APP_SECRET, ADMIN_PASSWORD, MANAGER_PASSWORD, PG_CA_CERT) live on the Worker, not here.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - 'Dockerfile'
+      - 'deploy/cloudflare/**'
+      - '.github/workflows/deploy-cloudflare.yml'
+  workflow_dispatch:
+    inputs:
+      restart:
+        description: 'Start a fresh container (reads the current Worker secrets, e.g. after changing a password)'
+        type: boolean
+        default: false
+
+# One deploy at a time; never cancel one that is already running.
+concurrency:
+  group: deploy-cloudflare
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            deploy/cloudflare/package-lock.json
+      - name: Check deploy secrets
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::Missing repository secret CLOUDFLARE_API_TOKEN"; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "::error::Missing repository secret CLOUDFLARE_ACCOUNT_ID"; exit 1; }
+      - name: Build the web app (served from Cloudflare's edge)
+        run: |
+          node -e "const fs=require('fs');fs.writeFileSync('public/release.json', JSON.stringify({sha: process.env.GITHUB_SHA, brand: 'swk-os-brand-pack'}) + '\n');"
+          npm ci
+          npm run build:web
+      - name: Install Worker dependencies
+        working-directory: deploy/cloudflare
+        run: npm ci
+      - name: Typecheck Worker
+        working-directory: deploy/cloudflare
+        run: npm run typecheck
+      - name: Deploy (builds the image from ../../Dockerfile)
+        working-directory: deploy/cloudflare
+        run: |
+          node -e "const fs=require('fs');fs.writeFileSync('../../public/release.json', JSON.stringify({sha: process.env.GITHUB_SHA, brand: 'swk-os-brand-pack'}) + '\n');"
+          node -e "const fs=require('fs');const f='wrangler.jsonc';fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace('\"swkproperties-os-v4\"','\"os-' + process.env.GITHUB_SHA.slice(0,12) + '\"'));"
+          # immediate: replace running containers in one step; the default gradual rollout can keep serving the previous image
+          RESTART_SUFFIX=''; [ "${{ inputs.restart }}" = 'true' ] && RESTART_SUFFIX="-r${GITHUB_RUN_NUMBER}"
+          npx wrangler deploy --containers-rollout immediate --var RELEASE_SHA:${GITHUB_SHA} --var RELEASE_ID:os-${GITHUB_SHA:0:12}${RESTART_SUFFIX}
+      - name: Wait for the app and Standalone Reception QR to answer
+        # The container cold-starts after a new image; allow up to 15 minutes.
+        run: |
+          for i in $(seq 1 45); do
+            rel=$(curl -s -m 30 https://os.swk.properties/release.json || true)
+            code=$(curl -s -o /dev/null -m 30 -w '%{http_code}' https://os.swk.properties/api/public/reception-qr/current || true)
+            echo "attempt $i: HTTP $code | release=$rel"
+            if [ "$code" = "200" ] && echo "$rel" | grep -q "${GITHUB_SHA}"; then
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::App did not return 200 with release ${GITHUB_SHA} within 15 minutes"
+          exit 1
