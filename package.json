@@ -1,0 +1,14 @@
+{
+  "name": "swk-hub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SWK Hub: in-house chat, boards, bases, automations, CRM and listings for SWK Properties",
+  "type": "module",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --no-warnings src/server.js",
+    "dev": "node --no-warnings --watch src/server.js",
+    "test": "node --no-warnings --test test/*.test.js"
+  },
+  "dependencies": { "ws": "^8.18.0" }
+}
