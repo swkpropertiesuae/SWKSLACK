@@ -6,8 +6,9 @@ const DEPTS = ['Off-Plan', 'Secondary', 'Leasing']
 
 export function seed() {
   if (one('SELECT id FROM users LIMIT 1')) return null
-  const email = process.env.ADMIN_EMAIL || 'admin@swk.local'
-  const password = process.env.ADMIN_PASSWORD || token(9)
+  // HUB_ADMIN_* wins so Hub and SWK OS can share one environment without sharing an admin account.
+  const email = process.env.HUB_ADMIN_EMAIL || process.env.ADMIN_EMAIL || 'admin@swk.local'
+  const password = process.env.HUB_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || token(9)
   const admin = run("INSERT INTO users(email,name,role,pass_hash) VALUES(?,?,'admin',?)", email, 'Admin', hashPassword(password)).lastInsertRowid
 
   const table = (name, kind, icon, fields, group) => {
@@ -44,13 +45,13 @@ export function seed() {
 
   const ch = {}
   for (const [name, topic] of [['general', 'Company-wide'], ['leads', 'New leads from every portal, auto-assigned'],
-    ['offplan', 'Dept 01 — Off-plan sales'], ['secondary', 'Dept 02 — Secondary market'], ['leasing', 'Dept 03 — Leasing']]) {
+    ['offplan', 'Dept 01 — Off-plan sales'], ['secondary', 'Dept 02 — Secondary market'], ['leasing', 'Dept 03 — Leasing'], ['swk-os', 'Live activity from SWK OS (ERP)']]) {
     ch[name] = run('INSERT INTO channels(name,topic,created_by) VALUES(?,?,?)', name, topic, admin).lastInsertRowid
     run('INSERT INTO members(channel_id,user_id) VALUES(?,?)', ch[name], admin)
   }
 
   const hook = run('INSERT INTO hooks(token,name,table_id) VALUES(?,?,?)', token(), 'Portal & website leads', leads).lastInsertRowid
-  const auto = (name, trigger, actions) => run('INSERT INTO automations(name,trigger,actions) VALUES(?,?,?)', name, JSON.stringify(trigger), JSON.stringify(actions))
+  const auto = (name, trigger, actions, enabled = 1) => run('INSERT INTO automations(name,enabled,trigger,actions) VALUES(?,?,?,?)', name, enabled, JSON.stringify(trigger), JSON.stringify(actions))
   auto('Lead router', { type: 'record.created', table_id: leads }, [
     { type: 'assign_round_robin', field: 'owner' },
     { type: 'post_message', channel_id: ch.leads, text: 'New {{source}} lead: *{{name}}* {{phone}} — {{department}}, budget AED {{budget}}. Owner: {{owner}}' },
@@ -62,6 +63,17 @@ export function seed() {
   auto('Listing published', { type: 'record.updated', table_id: listings, field: 'status', equals: 'Published' }, [
     { type: 'post_message', channel_id: ch.secondary, text: 'Live on portals: {{reference}} {{title}}, {{community}} — AED {{price}} ({{agent}})' },
   ])
+  auto('Follow-up due today', { type: 'record.due', table_id: leads, field: 'next_follow_up' }, [
+    { type: 'notify', user: '{{owner}}', text: 'Follow up today: {{name}} {{phone}} ({{stage}})' },
+  ])
+  auto('SWK OS activity', { type: 'os.event', event: 'leads.created,transactions.*,receipts.created,deal_withdrawals.*' }, [
+    { type: 'post_message', channel_id: ch['swk-os'], text: 'SWK OS · {{event}} · {{os.lead_no}}{{os.ref}} {{os.company}}{{os.title}}' },
+  ])
+  // Off until SWK OS is connected (OS_API_URL + OS_API_KEY); then turn it on under Automations.
+  auto('Qualified lead → SWK OS', { type: 'record.updated', table_id: leads, field: 'stage', equals: 'Qualified' }, [
+    { type: 'os_create', entity: 'leads', data: { company: '{{name}}', contact_name: '{{name}}', email: '{{email}}', phone: '{{phone}}', est_value: '{{budget}}', status: 'Qualified', notes: 'From SWK Hub lead #{{record.id}}. {{notes}}' } },
+    { type: 'post_message', channel_id: ch['swk-os'], text: '{{name}} sent to SWK OS as a qualified lead.' },
+  ], 0)
   run('INSERT INTO settings(key,value) VALUES(?,?)', 'feed_key', token(16))
   return { email, password, hook }
 }

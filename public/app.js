@@ -1,6 +1,6 @@
 // SWK Hub web client: no framework, DOM built with h() so user text is never parsed as HTML.
 const $app = document.getElementById('app')
-const S = { me: null, users: [], channels: [], tables: [], records: [], view: 'grid', thread: null, filter: '' }
+const S = { me: null, users: [], channels: [], tables: [], records: [], view: 'grid', thread: null, filter: '', mine: false, unread: 0, online: new Set(), meta: {}, cal: null }
 
 // ---------- helpers ----------
 function h(tag, props = {}, ...kids) {
@@ -17,7 +17,7 @@ function h(tag, props = {}, ...kids) {
 }
 const kids = (...a) => a.flat(Infinity).filter(x => x != null && x !== false)
 async function api(method, path, body, ctype = 'application/json') {
-  const res = await fetch(path, { method, headers: body !== undefined ? { 'content-type': ctype } : {}, body: body === undefined ? undefined : ctype === 'application/json' ? JSON.stringify(body) : body })
+  const res = await fetch(path, { method, headers: body !== undefined ? { 'content-type': ctype } : {}, body: body === undefined ? undefined : ctype === 'application/json' && !(body instanceof Blob) ? JSON.stringify(body) : body })
   const data = res.headers.get('content-type')?.includes('json') ? await res.json() : await res.text()
   if (res.status === 401 && path !== '/api/login') { S.me = null; renderLogin(); throw new Error('Signed out') }
   if (!res.ok) throw new Error(data?.error || `Error ${res.status}`)
@@ -50,7 +50,7 @@ function modal(title, body, actions = []) {
 // Chat text: escape-safe formatting built from text nodes.
 function formatText(body) {
   const out = []
-  const re = /(```[\s\S]+?```|`[^`]+`|\*[^*\n]+\*|https?:\/\/\S+|@[\w.-]+)/g
+  const re = /(```[\s\S]+?```|`[^`]+`|\*[^*\n]+\*|https?:\/\/\S+|\/api\/files\/\d+\/\S+|@[\w.-]+)/g
   let last = 0
   for (const m of body.matchAll(re)) {
     out.push(body.slice(last, m.index)); last = m.index + m[0].length
@@ -59,11 +59,24 @@ function formatText(body) {
     else if (t.startsWith('`')) out.push(h('code', {}, t.slice(1, -1)))
     else if (t.startsWith('*')) out.push(h('b', {}, t.slice(1, -1)))
     else if (t.startsWith('http')) out.push(h('a', { href: t, target: '_blank', rel: 'noopener noreferrer' }, t))
+    else if (t.startsWith('/api/files/')) out.push(fileLink(t))
     else out.push(h('span', { class: 'mention' }, t))
   }
   out.push(body.slice(last))
   return out
 }
+
+const fileName = url => decodeURIComponent(url.split('/').pop())
+const fileLink = url => /\.(png|jpe?g|gif|webp)$/i.test(url)
+  ? h('a', { href: url, target: '_blank', class: 'thumb' }, h('img', { src: url, alt: fileName(url), loading: 'lazy' }))
+  : h('a', { href: url, target: '_blank', class: 'file' }, '📎 ' + fileName(url))
+async function upload(file) {
+  if (file.size > 25e6) throw new Error('Files up to 25 MB')
+  // text/plain is refused by the server's CSRF guard, so send unknown and text files as raw bytes.
+  const type = !file.type || file.type.startsWith('text/') ? 'application/octet-stream' : file.type
+  return api('POST', '/api/files?name=' + encodeURIComponent(file.name), file, type)
+}
+const pickFile = onFile => { const i = h('input', { type: 'file', hidden: true, onchange: guard(async () => { if (i.files[0]) await onFile(i.files[0]); i.remove() }) }); document.body.append(i); i.click() }
 
 // ---------- boot ----------
 async function boot() {
@@ -74,7 +87,15 @@ async function boot() {
   route()
 }
 async function refreshAll() {
-  ;[S.users, S.channels, S.tables] = await Promise.all([api('GET', '/api/users'), api('GET', '/api/channels'), api('GET', '/api/tables')])
+  let notes, online
+  ;[S.users, S.channels, S.tables, notes, online, S.meta] = await Promise.all([api('GET', '/api/users'), api('GET', '/api/channels'), api('GET', '/api/tables'),
+    api('GET', '/api/notifications'), api('GET', '/api/presence'), api('GET', '/api/meta')])
+  S.unread = notes.unread; S.online = new Set(online)
+}
+function setBell() {
+  const b = document.getElementById('bell'); if (!b) return
+  b.textContent = S.unread ? `🔔 ${S.unread}` : '🔔'
+  b.setAttribute('aria-label', `Notifications, ${S.unread} unread`)
 }
 
 function renderLogin() {
@@ -114,22 +135,28 @@ function onEvent(ev) {
     later(async () => { S.channels = await api('GET', '/api/channels'); renderSide() })
   } else if (ev.type === 'message.update' || ev.type === 'message.delete') {
     if (r.kind === 'c' && Number(r.id) === ev.message?.channel_id || ev.channel_id === Number(r.id)) later(() => openChannel(r.id, true), 100)
-  } else if (ev.type === 'channels') later(async () => { S.channels = await api('GET', '/api/channels'); renderSide() })
+  } else if (ev.type === 'notification') {
+    S.unread++; setBell(); toast(ev.notification.text)
+    if (r.kind === 'notifications') later(openNotifications)
+  } else if (ev.type === 'presence') later(async () => { S.online = new Set(await api('GET', '/api/presence')); renderSide() })
+  else if (ev.type === 'comment') { if (document.getElementById(`act${ev.record_id}`)) loadActivity(ev.record_id) }
+  else if (ev.type === 'channels') later(async () => { S.channels = await api('GET', '/api/channels'); renderSide() })
   else if (ev.type === 'tables') later(async () => { S.tables = await api('GET', '/api/tables'); renderSide(); if (r.kind === 't') openTable(r.id) })
   else if ((ev.type === 'record' || ev.type === 'record.delete') && r.kind === 't' && Number(r.id) === (ev.record?.table_id ?? ev.table_id) && !document.querySelector('.modal-bg'))
     later(async () => { S.records = await api('GET', `/api/tables/${r.id}/records`); drawTable() }, 400)
 }
 
 // ---------- layout ----------
-const parseHash = () => { const [, kind = 'c', id = ''] = location.hash.split('/'); return { kind, id: decodeURIComponent(id) } }
+const parseHash = () => { const [, kind = 'home', id = '', sub = ''] = location.hash.split('/'); return { kind: kind || 'home', id: decodeURIComponent(id), sub } }
 function shell(title, sub, actions, body) {
   const side = h('nav', { class: 'side', 'aria-label': 'Workspace' })
   $app.replaceChildren(h('div', { class: 'shell' }, side, h('main', { class: 'main' },
     h('div', { class: 'top' }, h('button', { class: 'btn sm menu-btn', 'aria-label': 'Menu', onclick: () => side.classList.toggle('open') }, '☰'),
       h('div', { style: 'min-width:0' }, h('h1', {}, title), sub && h('div', { class: 'sub' }, sub)), h('div', { class: 'grow' }), actions,
+      h('a', { class: 'btn sm', id: 'bell', href: '#/notifications', 'aria-label': 'Notifications' }, '🔔'),
       h('input', { class: 'search', type: 'search', placeholder: 'Search…', 'aria-label': 'Search', onkeydown: e => { if (e.key === 'Enter' && e.target.value.trim()) location.hash = '#/search/' + encodeURIComponent(e.target.value.trim()) } })),
     h('div', { class: 'body', id: 'body' }, body))))
-  renderSide()
+  renderSide(); setBell()
   return document.getElementById('body')
 }
 function renderSide() {
@@ -141,15 +168,22 @@ function renderSide() {
   const groups = Object.keys(KIND).map(k => [k, S.tables.filter(t => t.kind === k)]).filter(([, ts]) => ts.length)
   side.replaceChildren(...kids(
     h('div', { class: 'brand' }, h('div', { class: 'logo' }, 'S'), h('div', {}, h('b', {}, 'SWK Hub'), h('small', {}, 'SWK Properties'))),
+    link('#/home', '⌂', 'Home'), link('#/notifications', '🔔', 'Notifications', { unread: S.unread }),
     h('div', { class: 'sec' }, 'Channels', h('button', { title: 'New channel', 'aria-label': 'New channel', onclick: newChannel }, '+')),
     S.channels.filter(c => !c.is_dm && c.member).map(c => link(`#/c/${c.id}`, c.is_private ? '🔒' : '#', c.name, { unread: c.unread })),
     S.channels.some(c => !c.is_dm && !c.member) ? link('#/browse', '…', 'Browse channels') : null,
     h('div', { class: 'sec' }, 'Direct messages', h('button', { title: 'New message', 'aria-label': 'New direct message', onclick: newDm }, '+')),
-    S.channels.filter(c => c.is_dm).map(c => link(`#/c/${c.id}`, '●', c.dm_with || S.me.name + ' (you)', { unread: c.unread })),
+    S.channels.filter(c => c.is_dm).map(c => {
+      const others = S.users.filter(u => u.id !== S.me.id && (c.dm_with || '').split(', ').includes(u.name))
+      return link(`#/c/${c.id}`, others.some(u => S.online.has(u.id)) ? '🟢' : '○', c.dm_with || S.me.name + ' (you)', { unread: c.unread })
+    }),
     groups.map(([k, ts]) => [h('div', { class: 'sec' }, KIND[k], h('button', { title: 'New table', 'aria-label': 'New ' + KIND[k], onclick: () => newTable(k) }, '+')),
       ts.map(t => link(`#/t/${t.id}`, t.icon || '▦', t.name))]),
     h('div', { class: 'sec' }, 'Workspace', groups.length < 4 ? h('button', { title: 'New base', 'aria-label': 'New base', onclick: () => newTable('base') }, '+') : null),
     link('#/automations', '⚡', 'Automations'),
+    h('div', { class: 'sec' }, 'SWK OS · ERP'),
+    link('#/os', '🏛', 'OS bridge & activity'),
+    S.meta.os_url ? h('a', { class: 'nav', href: S.meta.os_url, target: '_blank', rel: 'noopener' }, h('span', { class: 'ico' }, '↗'), h('span', {}, 'Open SWK OS')) : null,
     S.me.role === 'admin' ? [link('#/hooks', '🔗', 'Webhooks & feeds'), link('#/team', '👥', 'Team & audit')] : null,
     h('div', { class: 'me' }, h('span', {}, S.me.name), h('span', { class: 'row' },
       h('button', { onclick: changePassword }, 'Password'), h('button', { onclick: guard(async () => { await api('POST', '/api/logout', {}); S.me = null; ws?.close(); renderLogin() }) }, 'Sign out')))))
@@ -160,14 +194,16 @@ function route() {
   S.thread = null
   const go = guard(async () => {
     if (r.kind === 'c' && r.id) return openChannel(r.id)
-    if (r.kind === 't') return openTable(r.id)
+    if (r.kind === 'home') return openHome()
+    if (r.kind === 'notifications') return openNotifications()
+    if (r.kind === 'os') return openOs()
+    if (r.kind === 't') { await openTable(r.id); const rec = r.sub && S.records.find(x => x.id === Number(r.sub)); if (rec) openRecord(rec); return }
     if (r.kind === 'automations') return openAutomations()
     if (r.kind === 'hooks') return openHooks()
     if (r.kind === 'team') return openTeam()
     if (r.kind === 'browse') return openBrowse()
     if (r.kind === 'search') return openSearch(r.id)
-    const first = S.channels.find(c => c.name === 'general') || S.channels[0]
-    location.replace(first ? `#/c/${first.id}` : '#/automations')
+    location.replace('#/home')
   })
   go()
 }
@@ -179,13 +215,14 @@ function messageEl(m, inThread) {
   const react = e => guard(() => api('POST', `/api/messages/${m.id}/react`, { emoji: e }))()
   return h('div', { class: 'msg', id: `m${m.id}` },
     h('div', { class: 'avatar' + (m.bot_name ? ' bot' : '') }, m.bot_name ? '⚡' : initials(m.author)),
-    h('div', {}, h('div', {}, h('span', { class: 'who' }, m.author), h('span', { class: 'when' }, fmtTime(m.created_at), m.edited_at ? ' (edited)' : '')),
+    h('div', {}, h('div', {}, h('span', { class: 'who' }, m.author), h('span', { class: 'when' }, fmtTime(m.created_at), m.edited_at ? ' (edited)' : ''), m.pinned ? h('span', { class: 'when' }, ' · 📌 pinned') : null),
       h('div', { class: 'text' }, formatText(m.body)),
       Object.keys(m.reactions).length ? h('div', { class: 'reacts' }, Object.entries(m.reactions).map(([e, who]) =>
         h('button', { class: who.includes(S.me.id) ? 'mine' : '', title: who.map(userName).join(', '), onclick: () => react(e) }, `${e} ${who.length}`))) : null,
       !inThread && m.reply_count ? h('button', { class: 'replies', onclick: () => openThread(m) }, `${m.reply_count} ${m.reply_count === 1 ? 'reply' : 'replies'}`) : null),
     h('div', { class: 'tools' }, ['👍', '✅', '👀', '🎉'].map(e => h('button', { title: 'React ' + e, onclick: () => react(e) }, e)),
       !inThread ? h('button', { title: 'Reply in thread', onclick: () => openThread(m) }, '💬') : null,
+      h('button', { title: m.pinned ? 'Unpin' : 'Pin to channel', onclick: guard(() => api('POST', `/api/messages/${m.id}/pin`, {})) }, '📌'),
       mine ? h('button', { title: 'Edit', onclick: () => editMessage(m) }, '✏️') : null,
       mine || S.me.role === 'admin' ? h('button', { title: 'Delete', onclick: guard(async () => { if (confirm('Delete this message?')) await api('DELETE', `/api/messages/${m.id}`) }) }, '🗑') : null))
 }
@@ -202,16 +239,20 @@ function composer(onSend, placeholder) {
   const ta = h('textarea', { rows: 1, placeholder, 'aria-label': placeholder })
   const send = guard(async () => { const v = ta.value.trim(); if (!v) return; ta.value = ''; await onSend(v) })
   ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } })
-  return h('div', { class: 'composer' }, h('form', { onsubmit: e => { e.preventDefault(); send() } }, ta, h('button', { class: 'btn primary' }, 'Send')))
+  const attach = () => pickFile(async f => { const up = await upload(f); await onSend(`${ta.value.trim()} ${up.url}`.trim()); ta.value = '' })
+  ta.addEventListener('paste', e => { const f = [...(e.clipboardData?.files || [])][0]; if (f) { e.preventDefault(); guard(async () => { const up = await upload(f); await onSend(up.url) })() } })
+  return h('div', { class: 'composer' }, h('form', { onsubmit: e => { e.preventDefault(); send() } },
+    h('button', { type: 'button', class: 'btn', title: 'Attach a file', 'aria-label': 'Attach a file', onclick: attach }, '📎'), ta, h('button', { class: 'btn primary' }, 'Send')))
 }
 async function openChannel(id, keepThread) {
   const c = S.channels.find(x => x.id === Number(id))
-  if (!c) { await refreshAll(); if (!S.channels.find(x => x.id === Number(id))) return location.replace('#/') }
+  if (!c) { await refreshAll(); if (!S.channels.find(x => x.id === Number(id))) return location.replace('#/home') }
   const ch = S.channels.find(x => x.id === Number(id))
   const msgs = await api('GET', `/api/channels/${id}/messages`)
   ch.unread = 0
   const thread = keepThread ? S.thread : null
   const actions = h('div', { class: 'row' },
+    h('button', { class: 'btn sm', onclick: () => showPins(ch) }, '📌 Pinned'),
     !ch.is_dm ? h('button', { class: 'btn sm', onclick: () => editTopic(ch) }, 'Topic') : null,
     ch.is_private && !ch.is_dm ? h('button', { class: 'btn sm', onclick: () => addMember(ch) }, 'Add people') : null,
     !ch.is_dm && ch.name !== 'general' ? h('button', { class: 'btn sm', onclick: guard(async () => { await api('POST', `/api/channels/${ch.id}/leave`, {}); await refreshAll(); location.hash = '#/' }) }, 'Leave') : null)
@@ -240,6 +281,10 @@ function appendThread(m) { const l = document.getElementById('tlist'); if (l && 
 function editMessage(m) {
   const ta = h('textarea', { rows: 4, value: m.body })
   modal('Edit message', ta, [{ label: 'Save', run: () => api('PATCH', `/api/messages/${m.id}`, { body: ta.value }) }])
+}
+async function showPins(ch) {
+  const pins = await api('GET', `/api/channels/${ch.id}/pins`)
+  modal(`Pinned in ${chanLabel(ch)}`, h('div', { class: 'stack' }, pins.length ? pins.map(m => messageEl(m, true)) : h('p', { class: 'muted' }, 'Nothing pinned. Hover a message and press 📌.')))
 }
 function editTopic(ch) {
   const i = h('input', { value: ch.topic })
@@ -271,7 +316,8 @@ async function openTable(id) {
   T = S.tables.find(t => t.id === Number(id))
   if (!T) { S.tables = await api('GET', '/api/tables'); T = S.tables.find(t => t.id === Number(id)); if (!T) return location.replace('#/') }
   S.records = await api('GET', `/api/tables/${id}/records`)
-  S.view = T.group_field ? (localStorage.getItem('view' + id) || (T.kind === 'base' ? 'grid' : 'board')) : 'grid'
+  const saved = localStorage.getItem('view' + id)
+  S.view = views().includes(saved) ? saved : T.group_field && T.kind !== 'base' ? 'board' : 'grid'
   S.filter = ''
   const fileIn = h('input', { type: 'file', accept: '.csv,text/csv', hidden: true, onchange: guard(async e => {
     const f = e.target.files[0]; if (!f) return
@@ -286,10 +332,14 @@ async function openTable(id) {
   drawTable()
 }
 const titleKey = () => T.fields[0]?.key
+const dateKey = () => T.fields.find(f => f.type === 'date')?.key
+const userKeys = () => T.fields.filter(f => f.type === 'user').map(f => f.key)
+const views = () => ['grid', T.group_field && 'board', dateKey() && 'calendar'].filter(Boolean)
 function visibleRecords() {
   const q = S.filter.toLowerCase()
-  if (!q) return S.records
-  return S.records.filter(r => T.fields.some(f => String(f.type === 'user' ? userName(r.data[f.key]) : r.data[f.key] ?? '').toLowerCase().includes(q)))
+  let rows = S.mine ? S.records.filter(r => userKeys().some(k => r.data[k] === S.me.id)) : S.records
+  if (q) rows = rows.filter(r => T.fields.some(f => String(f.type === 'user' ? userName(r.data[f.key]) : r.data[f.key] ?? '').toLowerCase().includes(q)))
+  return rows
 }
 function drawTable() {
   const box = document.getElementById('tbody'); if (!box || !T) return
@@ -298,13 +348,14 @@ function drawTable() {
   box.replaceChildren(h('div', { class: 'toolbar' },
     h('button', { class: 'btn primary', onclick: guard(async () => { const r = await api('POST', `/api/tables/${T.id}/records`, { data: {} }); S.records.unshift(r); openRecord(r) }) }, '+ New record'),
     search,
-    T.group_field ? h('div', { class: 'views', role: 'group', 'aria-label': 'View' }, h('button', { class: S.view === 'grid' ? 'on' : '', onclick: () => setView('grid') }, 'Grid'), h('button', { class: S.view === 'board' ? 'on' : '', onclick: () => setView('board') }, 'Board')) : null),
+    userKeys().length ? h('label', { class: 'row', style: 'color:var(--text);font-size:13px' }, h('input', { type: 'checkbox', checked: S.mine, onchange: e => { S.mine = e.target.checked; drawView() } }), 'Only mine') : null,
+    views().length > 1 ? h('div', { class: 'views', role: 'group', 'aria-label': 'View' }, views().map(v => h('button', { class: S.view === v ? 'on' : '', onclick: () => setView(v) }, v[0].toUpperCase() + v.slice(1)))) : null),
   h('div', { id: 'view' }))
   drawView()
 }
 function drawView() {
   const v = document.getElementById('view'); if (!v) return
-  v.replaceChildren(S.view === 'board' && T.group_field ? boardView() : gridView())
+  v.replaceChildren(S.view === 'board' && T.group_field ? boardView() : S.view === 'calendar' && dateKey() ? calendarView() : gridView())
 }
 const saveField = (r, key) => guard(async val => { const out = await api('PATCH', `/api/records/${r.id}`, { data: { [key]: val } }); Object.assign(r, out) })
 function input(f, value, onChange) {
@@ -316,6 +367,13 @@ function input(f, value, onChange) {
     case 'longtext': return h('textarea', { value: value ?? '', onchange: ch, 'aria-label': f.name })
     case 'number': return h('input', { type: 'number', step: 'any', value: value ?? '', onchange: ch, 'aria-label': f.name })
     case 'date': return h('input', { type: 'date', value: value ?? '', onchange: ch, 'aria-label': f.name })
+    case 'file': {
+      // Stored as one file URL per line.
+      const urls = String(value || '').split('\n').filter(Boolean)
+      const box = h('div', { class: 'files', 'aria-label': f.name }, urls.map(u => fileLink(u)),
+        h('button', { type: 'button', class: 'btn sm', onclick: () => pickFile(async file => { const up = await upload(file); const next = [...urls, up.url].join('\n'); onChange(next); box.replaceWith(input(f, next, onChange)) }) }, '+ File'))
+      return box
+    }
     default: return h('input', { type: { email: 'email', phone: 'tel', url: 'url' }[f.type] || 'text', value: value ?? '', onchange: ch, 'aria-label': f.name })
   }
 }
@@ -345,14 +403,48 @@ function boardView() {
     return col
   }))
 }
+function calendarView() {
+  const key = dateKey(), rows = visibleRecords()
+  const now = new Date(), cur = S.cal || (S.cal = { y: now.getFullYear(), m: now.getMonth() })
+  const first = new Date(Date.UTC(cur.y, cur.m, 1)), start = (first.getUTCDay() + 6) % 7 // weeks start Monday
+  const days = new Date(Date.UTC(cur.y, cur.m + 1, 0)).getUTCDate()
+  const iso = d => new Date(Date.UTC(cur.y, cur.m, d)).toISOString().slice(0, 10)
+  const todayIso = new Date(Date.now() + 4 * 3600e3).toISOString().slice(0, 10)
+  const move = n => { const d = new Date(Date.UTC(cur.y, cur.m + n, 1)); S.cal = { y: d.getUTCFullYear(), m: d.getUTCMonth() }; drawView() }
+  const cells = Array.from({ length: start }, () => h('div', { class: 'cal-cell empty' }))
+  for (let d = 1; d <= days; d++) {
+    const items = rows.filter(r => String(r.data[key] || '').slice(0, 10) === iso(d))
+    cells.push(h('div', { class: 'cal-cell' + (iso(d) === todayIso ? ' today' : '') }, h('span', { class: 'cal-day' }, d),
+      items.map(r => h('button', { class: 'cal-item', onclick: () => openRecord(r) }, r.data[titleKey()] || 'Untitled'))))
+  }
+  return h('div', { class: 'stack' },
+    h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => move(-1), 'aria-label': 'Previous month' }, '‹'),
+      h('h2', {}, first.toLocaleDateString([], { month: 'long', year: 'numeric', timeZone: 'UTC' })), h('button', { class: 'btn sm', onclick: () => move(1), 'aria-label': 'Next month' }, '›'),
+      h('span', { class: 'muted' }, `by ${T.fields.find(f => f.key === key).name}`)),
+    h('div', { class: 'cal' }, ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => h('div', { class: 'cal-head' }, d)), cells))
+}
+async function loadActivity(id) {
+  const box = document.getElementById(`act${id}`); if (!box) return
+  const { comments, history } = await api('GET', `/api/records/${id}/activity`)
+  const items = [...comments.map(c => ({ at: c.created_at, el: h('div', { class: 'comment' }, h('b', {}, c.author || 'Someone'), h('span', { class: 'when' }, ' ' + c.created_at), h('div', { class: 'text' }, formatText(c.body))) })),
+    ...history.map(x => ({ at: x.created_at, el: h('div', { class: 'muted hist' }, `${x.created_at} · ${x.who} ${x.action === 'create' ? 'created this' : x.action === 'update' ? 'changed ' + x.detail : x.action}`) }))]
+    .sort((a, b) => a.at.localeCompare(b.at))
+  box.replaceChildren(...items.map(i => i.el))
+  if (!items.length) box.append(h('p', { class: 'muted' }, 'No activity yet.'))
+}
 function openRecord(r) {
   const draft = { ...r.data }
-  const form = h('div', { class: 'two' }, T.fields.map(f => h('label', { style: f.type === 'longtext' ? 'grid-column:1/-1' : '' }, f.name, input(f, draft[f.key], v => { draft[f.key] = v }))))
-  modal(`${T.name} #${r.id}`, h('div', { class: 'stack' }, form, h('div', { class: 'muted' }, `Created ${r.created_at} · updated ${r.updated_at}`)), [
+  const form = h('div', { class: 'two' }, T.fields.map(f => h('label', { style: f.type === 'longtext' || f.type === 'file' ? 'grid-column:1/-1' : '' }, f.name, input(f, draft[f.key], v => { draft[f.key] = v }))))
+  const ta = h('textarea', { rows: 2, placeholder: 'Write a comment… @name to notify', 'aria-label': 'Comment' })
+  const comment = guard(async () => { if (!ta.value.trim()) return; await api('POST', `/api/records/${r.id}/comments`, { body: ta.value }); ta.value = ''; loadActivity(r.id) })
+  const activity = h('div', { class: 'stack' }, h('h3', {}, 'Comments & history'), h('div', { class: 'activity', id: `act${r.id}` }),
+    h('div', { class: 'row' }, ta, h('button', { class: 'btn', onclick: comment }, 'Comment')))
+  setTimeout(() => loadActivity(r.id))
+  modal(`${T.name} #${r.id}`, h('div', { class: 'stack' }, form, h('div', { class: 'muted' }, `Created ${r.created_at} · updated ${r.updated_at}`), activity), [
     { label: 'Delete', class: 'danger', left: true, run: async () => { if (!confirm('Delete this record?')) return false; await api('DELETE', `/api/records/${r.id}`); S.records = S.records.filter(x => x.id !== r.id); drawView() } },
     { label: 'Save', run: async () => { Object.assign(r, await api('PATCH', `/api/records/${r.id}`, { data: draft })); drawView() } }])
 }
-const TYPES = ['text', 'longtext', 'number', 'select', 'date', 'user', 'email', 'phone', 'url', 'checkbox']
+const TYPES = ['text', 'longtext', 'number', 'select', 'date', 'user', 'email', 'phone', 'url', 'checkbox', 'file']
 function fieldsEditor(fields) {
   const box = h('div', { class: 'fields-ed' })
   const draw = () => box.replaceChildren(...kids(
@@ -408,11 +500,12 @@ function describeTrigger(t) {
   return { 'record.created': () => `a record is added to ${tName(t.table_id)}${t.field && t.equals ? ` with ${t.field} = ${t.equals}` : ''}`,
     'record.updated': () => `${tName(t.table_id)}${t.field ? '.' + t.field : ''} changes${t.equals ? ` to ${t.equals}` : ''}`,
     'message.posted': () => `a message${t.keyword ? ` containing “${t.keyword}”` : ''} is posted${t.channel_id ? ' in ' + cName(t.channel_id) : ''}`,
+    'record.due': () => `${tName(t.table_id)}.${t.field || 'date'} is today`, 'os.event': () => `SWK OS sends ${t.event || 'any event'}`,
     webhook: () => `webhook #${t.hook_id} is called`, schedule: () => `every ${t.every_minutes || 60} minutes` }[t.type]?.() || t.type
 }
 function describeAction(a) {
   return { post_message: () => `post in ${cName(a.channel_id)}`, create_record: () => `create ${tName(a.table_id)} record`, update_record: () => `update the record`,
-    assign_round_robin: () => `assign ${a.field} round-robin`, webhook: () => `send webhook` }[a.type]?.() || a.type
+    assign_round_robin: () => `assign ${a.field} round-robin`, webhook: () => `send webhook`, notify: () => `notify ${a.user}`, os_create: () => `create SWK OS ${a.entity}` }[a.type]?.() || a.type
 }
 const opt = (list, value, label = x => x.name, val = x => x.id) => [h('option', { value: '' }, '—'), list.map(x => h('option', { value: val(x), selected: String(val(x)) === String(value ?? '') }, label(x)))]
 function editAutomation(a = { name: '', enabled: true, trigger: { type: 'record.created' }, actions: [{ type: 'post_message' }] }) {
@@ -423,9 +516,12 @@ function editAutomation(a = { name: '', enabled: true, trigger: { type: 'record.
   const fieldsOf = id => tables.find(t => t.id === Number(id))?.fields || []
   const drawTrig = () => {
     const t = d.trigger
-    const ty = h('select', { onchange: e => { d.trigger = { type: e.target.value }; drawTrig() } }, ['record.created', 'record.updated', 'message.posted', 'webhook', 'schedule'].map(x => h('option', { selected: x === t.type }, x)))
+    const ty = h('select', { onchange: e => { d.trigger = { type: e.target.value }; drawTrig() } }, ['record.created', 'record.updated', 'record.due', 'message.posted', 'webhook', 'schedule', 'os.event'].map(x => h('option', { selected: x === t.type }, x)))
     const parts = [h('label', {}, 'Trigger', ty)]
-    if (t.type.startsWith('record.')) parts.push(h('div', { class: 'two' },
+    if (t.type === 'record.due') parts.push(h('div', { class: 'two' },
+      h('label', {}, 'Table', h('select', { onchange: e => { t.table_id = Number(e.target.value); drawTrig(); drawActs() } }, opt(tables, t.table_id))),
+      h('label', {}, 'Date field (checked each morning, Dubai time)', h('select', { onchange: e => { t.field = e.target.value } }, opt(fieldsOf(t.table_id).filter(f => f.type === 'date'), t.field, f => f.name, f => f.key)))))
+    else if (t.type.startsWith('record.')) parts.push(h('div', { class: 'two' },
       h('label', {}, 'Table', h('select', { onchange: e => { t.table_id = Number(e.target.value); drawTrig(); drawActs() } }, opt(tables, t.table_id))),
       h('label', {}, 'Field (optional)', h('select', { onchange: e => { t.field = e.target.value } }, opt(fieldsOf(t.table_id), t.field, f => f.name, f => f.key))),
       h('label', {}, 'Equals (optional)', h('input', { value: t.equals ?? '', oninput: e => { t.equals = e.target.value } }))))
@@ -433,6 +529,8 @@ function editAutomation(a = { name: '', enabled: true, trigger: { type: 'record.
       h('label', {}, 'Channel (optional)', h('select', { onchange: e => { t.channel_id = Number(e.target.value) || null } }, opt(chans, t.channel_id, chanLabel))),
       h('label', {}, 'Contains keyword', h('input', { value: t.keyword ?? '', oninput: e => { t.keyword = e.target.value } }))))
     if (t.type === 'webhook') parts.push(h('label', {}, 'Webhook ID (see Webhooks & feeds)', h('input', { type: 'number', value: t.hook_id ?? '', oninput: e => { t.hook_id = Number(e.target.value) } })))
+    if (t.type === 'os.event') parts.push(h('label', {}, 'SWK OS events (e.g. leads.created, transactions.*, * for all)', h('input', { value: t.event ?? '', oninput: e => { t.event = e.target.value } })),
+      h('p', { class: 'muted' }, 'Placeholders: {{event}} and {{os.<field>}} from the OS record, e.g. {{os.lead_no}} {{os.company}}'))
     if (t.type === 'schedule') parts.push(h('label', {}, 'Every (minutes)', h('input', { type: 'number', min: 1, value: t.every_minutes ?? 60, oninput: e => { t.every_minutes = Number(e.target.value) } })))
     const tf = fieldsOf(t.table_id)
     if (tf.length) parts.push(h('p', { class: 'muted' }, 'Placeholders: ', tf.map(f => `{{${f.key}}}`).join(' '), ' {{record.id}}'))
@@ -441,7 +539,7 @@ function editAutomation(a = { name: '', enabled: true, trigger: { type: 'record.
   }
   const json = (obj, set) => h('textarea', { rows: 3, value: JSON.stringify(obj || {}, null, 1), 'aria-label': 'Field values as JSON', onchange: e => { try { set(JSON.parse(e.target.value || '{}')); e.target.style.outline = '' } catch { e.target.style.outline = '2px solid var(--danger)' } } })
   const drawActs = () => acts.replaceChildren(...d.actions.map((x, i) => {
-    const ty = h('select', { onchange: e => { d.actions[i] = { type: e.target.value }; drawActs() } }, ['post_message', 'create_record', 'update_record', 'assign_round_robin', 'webhook'].map(v => h('option', { selected: v === x.type }, v)))
+    const ty = h('select', { onchange: e => { d.actions[i] = { type: e.target.value }; drawActs() } }, ['post_message', 'create_record', 'update_record', 'assign_round_robin', 'notify', 'webhook', 'os_create'].map(v => h('option', { selected: v === x.type }, v)))
     const parts = [h('div', { class: 'row' }, h('label', { style: 'flex:1' }, `Step ${i + 1}`, ty), h('button', { class: 'btn sm', onclick: () => { d.actions.splice(i, 1); drawActs() } }, 'Remove'))]
     if (x.type === 'post_message') parts.push(h('label', {}, 'Channel', h('select', { onchange: e => { x.channel_id = Number(e.target.value) } }, opt(chans, x.channel_id, chanLabel))),
       h('label', {}, 'Message', h('textarea', { rows: 2, value: x.text ?? '', oninput: e => { x.text = e.target.value } })))
@@ -449,6 +547,13 @@ function editAutomation(a = { name: '', enabled: true, trigger: { type: 'record.
       h('label', {}, `Values JSON — keys: ${fieldsOf(x.table_id).map(f => f.key).join(', ')}`, json(x.data, v => { x.data = v })))
     if (x.type === 'update_record') parts.push(h('label', {}, 'Set JSON, e.g. {"stage":"Contacted"}', json(x.set, v => { x.set = v })))
     if (x.type === 'assign_round_robin') parts.push(h('label', {}, 'User field', h('select', { onchange: e => { x.field = e.target.value } }, opt(fieldsOf(d.trigger.table_id).filter(f => f.type === 'user'), x.field, f => f.name, f => f.key))))
+    if (x.type === 'notify') parts.push(h('div', { class: 'two' },
+      h('label', {}, 'Person', h('select', { onchange: e => { x.user = e.target.value } },
+        h('option', { value: '' }, '—'), fieldsOf(d.trigger.table_id).filter(f => f.type === 'user').map(f => h('option', { value: `{{${f.key}}}`, selected: x.user === `{{${f.key}}}` }, `Record's ${f.name}`)),
+        S.users.filter(u => u.active).map(u => h('option', { value: u.id, selected: String(x.user) === String(u.id) }, u.name)))),
+      h('label', {}, 'Message', h('input', { value: x.text ?? '', oninput: e => { x.text = e.target.value } }))))
+    if (x.type === 'os_create') parts.push(h('label', {}, 'SWK OS entity (e.g. leads, contacts, viewings, tasks)', h('input', { value: x.entity ?? '', oninput: e => { x.entity = e.target.value } })),
+      h('label', {}, 'Values JSON (OS field keys), e.g. {"company":"{{name}}","phone":"{{phone}}"}', json(x.data, v => { x.data = v })))
     if (x.type === 'webhook') parts.push(h('label', {}, 'URL (receives JSON: record, data, message)', h('input', { type: 'url', value: x.url ?? '', placeholder: 'https://os.swk.properties/api/hooks/…', oninput: e => { x.url = e.target.value } })))
     return h('div', { class: 'act' }, parts)
   }), h('button', { class: 'btn sm', onclick: () => { d.actions.push({ type: 'post_message' }); drawActs() } }, '+ Add step'))
@@ -500,6 +605,68 @@ function changePassword() {
   const cur = h('input', { type: 'password', autocomplete: 'current-password' }), pw = h('input', { type: 'password', autocomplete: 'new-password' })
   modal('Change password', h('div', { class: 'stack' }, h('label', {}, 'Current password', cur), h('label', {}, 'New password (8+)', pw)),
     [{ label: 'Change', run: async () => { await api('POST', '/api/me/password', { current: cur.value, password: pw.value }); toast('Password changed') } }])
+}
+
+// ---------- home dashboard ----------
+const aed = n => 'AED ' + Math.round(n).toLocaleString('en-US')
+async function openHome() {
+  const d = await api('GET', '/api/dashboard')
+  const hour = new Date().getHours()
+  const item = x => h('a', { class: 'li', href: `#/t/${x.table_id}/${x.id}` }, h('span', {}, x.title), h('span', { class: 'muted' }, [x.table, x.status, x.date].filter(Boolean).join(' · ')))
+  const tile = (label, value, href) => h('a', { class: 'card tile', href }, h('span', { class: 'muted' }, label), h('b', {}, value))
+  const pipe = p => {
+    const max = Math.max(1, ...p.groups.map(g => g.count))
+    return h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h3', {}, p.table), h('span', { class: 'muted' }, `${p.total} by ${p.field.toLowerCase()}`), h('div', { style: 'flex:1' }), h('a', { class: 'btn sm', href: `#/t/${p.table_id}` }, 'Open')),
+      h('div', { class: 'bars', role: 'table', 'aria-label': `${p.table} by ${p.field}` }, p.groups.map(g => h('a', { class: 'bar-row', role: 'row', href: `#/t/${p.table_id}`,
+        title: `${g.name}: ${g.count} record${g.count === 1 ? '' : 's'}${p.money ? ` · ${aed(g.sum)} ${p.money.replace(/\s*\(AED\)/, '').toLowerCase()}` : ''}` },
+        h('span', { class: 'bar-label', role: 'cell' }, g.name),
+        h('span', { class: 'bar-track', role: 'cell' }, g.count ? h('span', { class: 'bar', style: `width:${(g.count / max) * 100}%` }) : null),
+        h('span', { class: 'bar-val', role: 'cell' }, g.count, p.money && g.sum ? h('small', { class: 'muted' }, ' ' + aed(g.sum)) : null)))))
+  }
+  shell(`Good ${hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening'}, ${S.me.name.split(' ')[0]}`, `Today is ${new Date().toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long' })}`, null,
+    h('div', { class: 'stack' },
+      h('div', { class: 'tiles' }, tile('Due or overdue for you', d.due.length, '#/home'), tile('Assigned to you', d.mine.length, '#/home'),
+        tile('Unread notifications', d.unread, '#/notifications'), tile('Unread channels', S.channels.filter(c => c.member && c.unread).length, '#/home')),
+      h('div', { class: 'cols2' },
+        h('div', { class: 'card stack' }, h('h3', {}, '⏰ Due today & overdue'), d.due.length ? d.due.map(item) : h('p', { class: 'muted' }, 'Nothing due. Nice.')),
+        h('div', { class: 'card stack' }, h('h3', {}, '📌 My open items'), d.mine.length ? d.mine.slice(0, 12).map(item) : h('p', { class: 'muted' }, 'Nothing assigned to you.'))),
+      h('div', { class: 'cols2' }, d.pipelines.map(pipe)),
+      h('div', { class: 'card stack' }, h('h3', {}, 'Recent activity'),
+        d.activity.map(a => h('div', { class: 'muted hist' }, `${a.created_at} · ${a.who} ${a.action} ${a.entity} #${a.entity_id ?? ''} ${a.detail || ''}`)))))
+}
+
+// ---------- notifications ----------
+async function openNotifications() {
+  const { items, unread } = await api('GET', '/api/notifications')
+  S.unread = unread
+  const read = n => guard(async () => { if (!n.read) { await api('POST', '/api/notifications/read', { id: n.id }); S.unread = Math.max(0, S.unread - 1) } if (n.link) location.hash = n.link })
+  shell('Notifications', `${unread} unread`, unread ? h('button', { class: 'btn sm', onclick: guard(async () => { await api('POST', '/api/notifications/read', {}); S.unread = 0; openNotifications() }) }, 'Mark all read') : null,
+    h('div', { class: 'stack' }, items.length ? items.map(n => h('button', { class: 'card notif' + (n.read ? '' : ' unread'), onclick: read(n) },
+      h('span', {}, n.read ? '' : '● ', n.text), h('span', { class: 'muted' }, n.created_at))) : h('p', { class: 'muted' }, 'You are all caught up. Mentions, assignments, comments and reminders appear here.')))
+}
+
+// ---------- SWK OS ----------
+async function openOs() {
+  const os = await api('GET', '/api/os')
+  const dot = (ok, yes, no) => h('div', { class: 'row' }, h('span', { class: 'pill' }, ok ? '✓ ' + yes : '✕ ' + no))
+  const deep = [['Dashboard', '/dashboard'], ['Pipeline', '/swk/pipeline'], ['Market Pulse', '/swk/market'], ['Withdrawals & refunds', '/swk/withdrawals'], ['Recycle bin', '/swk/recycle-bin']]
+  shell('SWK OS · ERP', 'Accounting, transactions, leases, HR, compliance and DLD data live in SWK OS. Hub is where the team talks and works the pipeline.',
+    os.url ? h('a', { class: 'btn primary', href: os.url, target: '_blank', rel: 'noopener' }, 'Open SWK OS ↗') : null,
+    h('div', { class: 'stack' },
+      h('div', { class: 'card stack' }, h('h2', {}, 'Connection'),
+        dot(os.url, 'Link: ' + os.url, 'OS_URL not set'), dot(os.online, 'SWK OS is reachable', 'SWK OS not reachable from Hub'),
+        dot(os.push, 'Hub can create records in SWK OS (os_create)', 'Push off: set OS_API_URL and OS_API_KEY'),
+        dot(os.events_in, `Receiving events at ${location.origin}/os/events`, 'Events off: set OS_WEBHOOK_SECRET'),
+        os.url ? h('div', { class: 'row' }, deep.map(([l, p]) => h('a', { class: 'btn sm', href: os.url.replace(/\/$/, '') + p, target: '_blank', rel: 'noopener' }, l + ' ↗'))) : null),
+      h('div', { class: 'card stack' }, h('h2', {}, 'Set up the link (once)'),
+        h('ol', { class: 'steps' },
+          h('li', {}, 'In SWK OS → Administration → API keys, create a key for "SWK Hub". Put it in Hub as ', h('code', {}, 'OS_API_KEY'), ' and the OS address as ', h('code', {}, 'OS_API_URL'), '.'),
+          h('li', {}, 'In SWK OS → Administration → Webhooks, add ', h('code', {}, `${location.origin}/os/events`), ' with a secret and events like ', h('code', {}, 'leads.*, transactions.*, receipts.*'), '. Put the same secret in Hub as ', h('code', {}, 'OS_WEBHOOK_SECRET'), '.'),
+          h('li', {}, 'Restart Hub, then turn on the "Qualified lead → SWK OS" automation.'))),
+      h('div', { class: 'card stack' }, h('h2', {}, 'Latest events from SWK OS'),
+        os.events.length ? os.events.map(e => h('div', { class: 'hist' }, h('b', {}, e.event), h('span', { class: 'muted' }, ` · ${e.created_at} · `),
+          Object.entries(e.data).filter(([, v]) => v != null && typeof v !== 'object' && v !== '').slice(0, 5).map(([k, v]) => `${k}: ${v}`).join(' · ')))
+          : h('p', { class: 'muted' }, 'No events yet.'))))
 }
 
 // ---------- search ----------

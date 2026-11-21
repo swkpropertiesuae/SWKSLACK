@@ -1,13 +1,19 @@
 import { createServer } from 'node:http'
-import { readFile } from 'node:fs/promises'
-import { join, normalize, extname } from 'node:path'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { createHmac, timingSafeEqual } from 'node:crypto'
+import { join, normalize, extname, dirname, resolve } from 'node:path'
 import { WebSocketServer } from 'ws'
 import { db, one, all, run, token, hashPassword, checkPassword, setting, tableOut, recordOut, autoOut, audit } from './db.js'
-import { FIELD_TYPES, TRIGGERS, ACTIONS, setBroadcast, createRecord, updateRecord, postMessage, withAuthor, fire, tickSchedules } from './engine.js'
+import { FIELD_TYPES, TRIGGERS, ACTIONS, setBroadcast, createRecord, updateRecord, postMessage, withAuthor, fire, tickSchedules, notify, today } from './engine.js'
 import { seed } from './seed.js'
 
 const PUBLIC = join(import.meta.dirname, '..', 'public')
 const SESSION_DAYS = 14
+const FILES = resolve(process.env.FILES_DIR || (process.env.DB_FILE && process.env.DB_FILE !== ':memory:' ? join(dirname(process.env.DB_FILE), 'files') : 'data/files'))
+const MAX_UPLOAD = 25e6
+// Only these types are shown inline; everything else downloads, so an uploaded page can never run as this site.
+const INLINE = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf'])
+const OS = { url: process.env.OS_URL || '', api: process.env.OS_API_URL || process.env.OS_URL || '', secret: process.env.OS_WEBHOOK_SECRET || '' }
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' }
 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status } }
@@ -378,13 +384,129 @@ route('GET', '/feeds/:id', ({ params, query }) => {
   return { raw: `<?xml version="1.0" encoding="UTF-8"?>\n<list count="${items.length}">\n${body}\n</list>`, type: 'application/xml; charset=utf-8' }
 }, { public: true })
 route('GET', '/api/audit', ({ user }) => { admin(user); return all('SELECT a.*, u.name AS user_name FROM audit a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 200') })
-route('GET', '/api/meta', () => ({ field_types: FIELD_TYPES, triggers: TRIGGERS, actions: ACTIONS }))
+route('GET', '/api/meta', () => ({ field_types: FIELD_TYPES, triggers: TRIGGERS, actions: ACTIONS, os_url: OS.url }))
+
+// Files (chat attachments and file fields)
+route('POST', '/api/files', async ({ user, raw, req, query }) => {
+  if (!raw.length) fail(400, 'Empty file')
+  const name = String(query.get('name') || 'file').replace(/[\\/\0]/g, '_').slice(0, 200)
+  const mime = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].toLowerCase()
+  const path = `${new Date().toISOString().slice(0, 7)}/${token(12)}`
+  await mkdir(join(FILES, path.slice(0, 7)), { recursive: true })
+  await writeFile(join(FILES, path), raw)
+  const id = run('INSERT INTO files(name,mime,size,path,user_id) VALUES(?,?,?,?,?)', name, mime, raw.length, path, user.id).lastInsertRowid
+  return { id, name, mime, size: raw.length, url: `/api/files/${id}/${encodeURIComponent(name)}` }
+}, { rawBody: 'buffer', maxBody: MAX_UPLOAD })
+route('GET', '/api/files/:id/:name', async ({ params, res }) => {
+  const f = one('SELECT * FROM files WHERE id=?', params.id) || fail(404, 'File not found')
+  const data = await readFile(join(FILES, f.path)).catch(() => fail(404, 'File missing on disk'))
+  const inline = INLINE.has(f.mime)
+  res.setHeader('content-security-policy', "sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'")
+  res.setHeader('content-disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(f.name)}`)
+  res.setHeader('cache-control', 'private, max-age=86400')
+  return { raw: data, type: inline ? f.mime : 'application/octet-stream' }
+})
+
+// Record comments + history
+route('GET', '/api/records/:id/activity', ({ params }) => {
+  const r = one('SELECT id FROM records WHERE id=?', params.id) || fail(404, 'Record not found')
+  return {
+    comments: all('SELECT c.*, u.name AS author FROM comments c LEFT JOIN users u ON u.id=c.user_id WHERE record_id=? ORDER BY c.id', r.id),
+    history: all("SELECT a.action, a.detail, a.created_at, COALESCE(u.name,'Automation') AS who FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE entity='record' AND entity_id=? ORDER BY a.id", r.id),
+  }
+})
+route('POST', '/api/records/:id/comments', ({ user, body, params }) => {
+  const r = recordOut(one('SELECT * FROM records WHERE id=?', params.id)) || fail(404, 'Record not found')
+  const text = String(body.body || '').trim().slice(0, 5000) || fail(400, 'Comment is empty')
+  const id = run('INSERT INTO comments(record_id,user_id,body) VALUES(?,?,?)', r.id, user.id, text).lastInsertRowid
+  const t = tableById(r.table_id)
+  const title = r.data[t.fields[0]?.key] || `#${r.id}`
+  const link = `#/t/${t.id}/${r.id}`
+  // Tell the people on the record (person fields) and anyone @mentioned.
+  const people = new Set(t.fields.filter(f => f.type === 'user').map(f => r.data[f.key]).filter(Boolean))
+  for (const m of text.matchAll(/@([\w.-]+)/g))
+    for (const u of all('SELECT id,name,email FROM users WHERE active=1'))
+      if ([u.name.split(/\s+/)[0], u.name.replace(/\s+/g, ''), u.email.split('@')[0]].some(x => x.toLowerCase() === m[1].toLowerCase())) people.add(u.id)
+  for (const uid of people) if (uid !== user.id) notify(uid, `${user.name} commented on ${t.name}: ${title} — ${text.slice(0, 120)}`, link)
+  broadcast({ type: 'comment', record_id: r.id })
+  return one('SELECT c.*, u.name AS author FROM comments c LEFT JOIN users u ON u.id=c.user_id WHERE c.id=?', id)
+})
+
+// Notifications inbox
+route('GET', '/api/notifications', ({ user }) => ({
+  unread: one('SELECT COUNT(*) c FROM notifications WHERE user_id=? AND read=0', user.id).c,
+  items: all('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 100', user.id),
+}))
+route('POST', '/api/notifications/read', ({ user, body }) => {
+  if (body.id) run('UPDATE notifications SET read=1 WHERE id=? AND user_id=?', body.id, user.id)
+  else run('UPDATE notifications SET read=1 WHERE user_id=?', user.id)
+  return { ok: true }
+})
+
+// Pins + presence
+route('POST', '/api/messages/:id/pin', ({ user, params }) => {
+  const m = ownMessage(user, params.id)
+  run('UPDATE messages SET pinned=? WHERE id=?', m.pinned ? 0 : 1, m.id)
+  const out = withAuthor(one('SELECT * FROM messages WHERE id=?', m.id))
+  broadcast({ type: 'message.update', message: out }, m.channel_id)
+  return out
+})
+route('GET', '/api/channels/:id/pins', ({ user, params }) => all('SELECT * FROM messages WHERE channel_id=? AND pinned=1 ORDER BY id DESC', channelFor(user, params.id).id).map(withAuthor))
+route('GET', '/api/presence', () => [...new Set([...sockets.values()].map(u => u.id))])
+
+// Home dashboard
+const CLOSED = /^(won|lost|closed|done|sold|rented|sold \/ rented|archived|withdrawn|cancelled|completed)$/i
+route('GET', '/api/dashboard', ({ user }) => {
+  const day = today()
+  const tables = all('SELECT * FROM tables ORDER BY kind, name').map(tableOut)
+  const pipelines = [], mine = [], due = []
+  for (const t of tables) {
+    const recs = all('SELECT * FROM records WHERE table_id=?', t.id).map(recordOut)
+    const userKeys = t.fields.filter(f => f.type === 'user').map(f => f.key)
+    const dateKey = t.fields.find(f => f.type === 'date')?.key
+    const g = t.fields.find(f => f.key === t.group_field)
+    const money = t.fields.find(f => f.type === 'number' && /aed|value|price|budget|amount|commission/i.test(f.name))
+    if (g) pipelines.push({ table_id: t.id, table: t.name, field: g.name, money: money?.name ?? null, total: recs.length,
+      groups: g.options.map(o => { const rs = recs.filter(r => r.data[g.key] === o); return { name: o, count: rs.length, sum: money ? rs.reduce((n, r) => n + (Number(r.data[money.key]) || 0), 0) : null } }) })
+    for (const r of recs) {
+      if (g && CLOSED.test(r.data[g.key] || '')) continue
+      const item = { table_id: t.id, table: t.name, id: r.id, title: r.data[t.fields[0]?.key] || `#${r.id}`, status: g ? r.data[g.key] : null, date: dateKey ? r.data[dateKey] : null }
+      if (userKeys.some(k => r.data[k] === user.id)) mine.push(item)
+      if (item.date && item.date.slice(0, 10) <= day && userKeys.some(k => r.data[k] === user.id)) due.push(item)
+    }
+  }
+  return {
+    today: day, pipelines, mine: mine.slice(0, 50), due: due.sort((a, b) => a.date.localeCompare(b.date)).slice(0, 50),
+    activity: all("SELECT a.action, a.entity, a.entity_id, a.detail, a.created_at, COALESCE(u.name,'Automation') AS who FROM audit a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 15"),
+    unread: one('SELECT COUNT(*) c FROM notifications WHERE user_id=? AND read=0', user.id).c,
+  }
+})
+
+// SWK OS bridge: signed events in, status out. Creating records in OS is the os_create automation action.
+route('GET', '/api/os', async () => {
+  let online = false
+  if (OS.api) online = await fetch(new URL('/api/health', OS.api), { signal: AbortSignal.timeout(3000) }).then(r => r.ok, () => false)
+  return { url: OS.url, online, push: !!(OS.api && process.env.OS_API_KEY), events_in: !!OS.secret,
+    events: all('SELECT id,event,created_at,data FROM os_events ORDER BY id DESC LIMIT 30').map(e => ({ ...e, data: JSON.parse(e.data) })) }
+})
+route('POST', '/os/events', ({ raw, req }) => {
+  if (!OS.secret) fail(503, 'Set OS_WEBHOOK_SECRET to accept SWK OS events')
+  const expected = 'sha256=' + createHmac('sha256', OS.secret).update(raw).digest('hex')
+  const got = String(req.headers['x-swk-signature'] || '')
+  if (got.length !== expected.length || !timingSafeEqual(Buffer.from(got), Buffer.from(expected))) fail(401, 'Bad signature')
+  const { event, data } = JSON.parse(raw)
+  run('INSERT INTO os_events(event,data) VALUES(?,?)', String(event), JSON.stringify(data ?? {}))
+  run('DELETE FROM os_events WHERE id < (SELECT MAX(id) - 1000 FROM os_events)')
+  fire('os.event', { event: String(event), data: data ?? {}, os: data ?? {} })
+  return { ok: true }
+}, { public: true, rawBody: true })
+
 
 // ---------- server ----------
-async function readBody(req) {
+async function readBody(req, max = 2e6) {
   const chunks = []; let size = 0
-  for await (const c of req) { size += c.length; if (size > 2e6) fail(413, 'Body too large'); chunks.push(c) }
-  return Buffer.concat(chunks).toString('utf8')
+  for await (const c of req) { size += c.length; if (size > max) fail(413, 'Body too large'); chunks.push(c) }
+  return Buffer.concat(chunks)
 }
 
 async function serveStatic(pathname, res) {
@@ -409,9 +531,10 @@ export async function handle(req, res) {
       const user = sessionUser(req)
       if (!r.public && !user) fail(401, 'Sign in required')
       const ctype = req.headers['content-type'] || ''
-      // CSRF: only POST can be sent cross-site without a CORS preflight, so cookie-authenticated POSTs must be JSON or CSV.
-      if (!r.public && req.method === 'POST' && !/^(application\/json|text\/csv)/.test(ctype)) fail(415, 'Send JSON')
-      const raw = req.method === 'GET' ? '' : await readBody(req)
+      // CSRF: only POST can be sent cross-site without a CORS preflight, and only as a form or text/plain. Refuse those.
+      if (!r.public && req.method === 'POST' && (!ctype || /^(application\/x-www-form-urlencoded|multipart\/form-data|text\/plain)/i.test(ctype))) fail(415, 'Send JSON')
+      const buf = req.method === 'GET' ? Buffer.alloc(0) : await readBody(req, r.maxBody)
+      const raw = r.rawBody === 'buffer' ? buf : buf.toString('utf8')
       let body = {}
       if (!r.rawBody && raw) { try { body = JSON.parse(raw) } catch { fail(400, 'Invalid JSON') } }
       const out = await r.handler({ req, res, user, body, raw, params: m.groups || {}, query: url.searchParams })
@@ -429,8 +552,8 @@ export async function handle(req, res) {
 
 // ---------- realtime ----------
 const sockets = new Map() // ws -> user
-function broadcast(event, channelId) {
-  const allowed = channelId ? new Set(all('SELECT user_id FROM members WHERE channel_id=?', channelId).map(r => r.user_id)) : null
+function broadcast(event, channelId, userIds) {
+  const allowed = userIds ? new Set(userIds) : channelId ? new Set(all('SELECT user_id FROM members WHERE channel_id=?', channelId).map(r => r.user_id)) : null
   const pub = channelId ? one('SELECT is_private, is_dm FROM channels WHERE id=?', channelId) : null
   const msg = JSON.stringify(event)
   for (const [ws, u] of sockets)
@@ -438,7 +561,7 @@ function broadcast(event, channelId) {
 }
 setBroadcast(broadcast)
 
-export function start(port = Number(process.env.PORT) || 8080) {
+export function start(port = Number(process.env.PORT) || 3000) {
   const created = seed()
   if (created) console.log(`\n  SWK Hub first boot. Admin login: ${created.email} / ${created.password}\n  Change this password after signing in.\n`)
   const server = createServer(handle)
@@ -447,7 +570,8 @@ export function start(port = Number(process.env.PORT) || 8080) {
     const user = sessionUser(req)
     if (!user) return ws.close(4001, 'unauthorized')
     sockets.set(ws, user)
-    ws.on('close', () => sockets.delete(ws))
+    broadcast({ type: 'presence' })
+    ws.on('close', () => { sockets.delete(ws); broadcast({ type: 'presence' }) })
   })
   const timer = setInterval(() => { try { tickSchedules(); run('DELETE FROM sessions WHERE expires<?', Date.now()) } catch (e) { console.error(e) } }, 60000)
   server.on('close', () => clearInterval(timer))

@@ -30,8 +30,20 @@ CREATE TABLE IF NOT EXISTS automation_runs(id INTEGER PRIMARY KEY, automation_id
 CREATE TABLE IF NOT EXISTS hooks(id INTEGER PRIMARY KEY, token TEXT UNIQUE NOT NULL, name TEXT NOT NULL, table_id INTEGER, channel_id INTEGER,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, name TEXT NOT NULL, mime TEXT, size INTEGER, path TEXT NOT NULL, user_id INTEGER,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY, record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE, user_id INTEGER,
+  body TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL,
+  link TEXT, read INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS notif_u ON notifications(user_id, read, id);
+CREATE TABLE IF NOT EXISTS os_events(id INTEGER PRIMARY KEY, event TEXT, data TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, user_id INTEGER, action TEXT, entity TEXT, entity_id INTEGER, detail TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);`)
+
+// Columns added after v1: add them to databases created earlier.
+for (const [table, col] of [['messages', 'pinned INTEGER DEFAULT 0']])
+  try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`) } catch { /* already there */ }
 
 export const one = (sql, ...a) => db.prepare(sql).get(...a)
 export const all = (sql, ...a) => db.prepare(sql).all(...a)

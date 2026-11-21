@@ -19,6 +19,12 @@ export function isPrivateOrLoopbackHost(hostname: string): boolean {
   return false
 }
 
+// SWK Hub runs next to SWK OS (same host or same docker network), so its exact origin from HUB_URL is allowed
+// even though it is a private address. Every other private destination stays blocked.
+function isTrustedHub(url: URL): boolean {
+  try { return !!process.env.HUB_URL && new URL(process.env.HUB_URL).origin === url.origin } catch { return false }
+}
+
 function matches(spec: string, event: string): boolean {
   return spec.split(',').map(s => s.trim()).filter(Boolean).some(s => s === '*' || s === event || (s.endsWith('.*') && event.startsWith(s.slice(0, -1))) || (s.endsWith('*') && event.startsWith(s.slice(0, -1))))
 }
@@ -39,7 +45,7 @@ async function deliver(h: any, event: string, payload: any) {
   let status = 0, ok = 0, response = ''
   try {
     const parsed = new URL(String(h.url ?? ''))
-    if (!['http:', 'https:'].includes(parsed.protocol) || isPrivateOrLoopbackHost(parsed.hostname)) {
+    if (!['http:', 'https:'].includes(parsed.protocol) || (isPrivateOrLoopbackHost(parsed.hostname) && !isTrustedHub(parsed))) {
       throw new Error('Blocked private or invalid webhook destination URL')
     }
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 7000)

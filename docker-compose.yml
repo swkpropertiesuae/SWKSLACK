@@ -1,0 +1,29 @@
+# SWK Hub + SWK OS together. Copy .env.example to .env and fill it first.
+services:
+  hub:
+    build: .
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      PORT: 3000
+      DB_FILE: /data/hub.db
+      HUB_ADMIN_EMAIL: ${HUB_ADMIN_EMAIL:-admin@swkpropertiesuae.com}
+      HUB_ADMIN_PASSWORD: ${HUB_ADMIN_PASSWORD:?set HUB_ADMIN_PASSWORD in .env}
+      OS_URL: ${OS_PUBLIC_URL:-http://localhost:8080}
+      OS_API_URL: http://os:8080
+      OS_API_KEY: ${OS_API_KEY:-}
+      OS_WEBHOOK_SECRET: ${OS_WEBHOOK_SECRET:?set OS_WEBHOOK_SECRET in .env}
+    volumes: [hub-data:/data]
+    depends_on: [os]
+  os:
+    build: ./os
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    env_file: [os/.env]
+    environment:
+      DATA_DIR: /data
+      HUB_URL: http://hub:3000
+    volumes: [os-data:/data]
+volumes:
+  hub-data:
+  os-data:

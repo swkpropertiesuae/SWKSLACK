@@ -2,13 +2,22 @@
   "name": "swk-hub",
   "version": "1.0.0",
   "private": true,
-  "description": "SWK Hub: in-house chat, boards, bases, automations, CRM and listings for SWK Properties",
+  "description": "SWK Hub + SWK OS: in-house chat, boards, bases, automations, CRM, listings and the SWK OS ERP",
   "type": "module",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "start": "node --no-warnings src/server.js",
     "dev": "node --no-warnings --watch src/server.js",
-    "test": "node --no-warnings --test test/*.test.js"
+    "test": "node --no-warnings --test test/*.test.js",
+    "os:install": "npm --prefix os ci",
+    "os:build": "npm --prefix os run build",
+    "os:test": "npm --prefix os test",
+    "start:all": "node scripts/run-all.js",
+    "dev:all": "node scripts/run-all.js --dev"
   },
-  "dependencies": { "ws": "^8.18.0" }
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
